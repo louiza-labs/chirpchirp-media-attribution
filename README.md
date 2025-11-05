@@ -101,41 +101,89 @@ Ensure you also have an `images` table with at least:
 
 ## Usage
 
-### Single Batch Mode
+The service can be used in two ways: as a FastAPI HTTP server (recommended for production) or as a CLI script.
 
-Process a single batch of unattributed images:
+### FastAPI HTTP Server (Recommended)
+
+Start the FastAPI server:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+Or with auto-reload for development:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+The server will be available at `http://localhost:8000`.
+
+#### API Endpoints
+
+**GET `/run-analysis`**
+
+Run bird species attribution analysis on unattributed images.
+
+**Query Parameters:**
+
+- `continuous` (bool, optional): Process all unattributed images in batches until none remain. Default: `false`
+- `batch_size` (int, optional): Override `BATCH_SIZE` from env. Default: uses `BATCH_SIZE` from environment or 50
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "images_processed": 50,
+  "attributions_created": 120,
+  "message": "Processed 50 images, created 120 attributions"
+}
+```
+
+**Example Requests:**
+
+```bash
+# Single batch mode
+curl "http://localhost:8000/run-analysis"
+
+# With custom batch size
+curl "http://localhost:8000/run-analysis?batch_size=100"
+
+# Continuous mode (process all unattributed images)
+curl "http://localhost:8000/run-analysis?continuous=true"
+
+# Combined options
+curl "http://localhost:8000/run-analysis?continuous=true&batch_size=25"
+```
+
+**What happens when you call the endpoint:**
+
+1. Fetches up to `BATCH_SIZE` unattributed images from Supabase
+2. Downloads images to a temporary directory
+3. Runs SpeciesNet classification with geofencing
+4. Stores results back to Supabase
+5. Retries generic "Bird" classifications up to 5 times
+6. Falls back to OpenAI Vision if still generic after retries
+7. Returns JSON response with processing statistics
+
+### CLI Mode (Backward Compatibility)
+
+You can still run the service as a command-line script:
+
+**Single Batch Mode:**
 
 ```bash
 python main.py
 ```
 
-This will:
-
-1. Fetch up to `BATCH_SIZE` unattributed images from Supabase
-2. Download images to a temporary directory
-3. Run SpeciesNet classification with geofencing
-4. Store results back to Supabase
-5. Retry generic "Bird" classifications up to 5 times
-6. Fall back to OpenAI Vision if still generic after retries
-
-### Continuous Mode
-
-Process all unattributed images in batches until none remain:
+**Continuous Mode:**
 
 ```bash
 python main.py --continuous
 ```
 
-This mode will:
-
-- Process images in batches of `BATCH_SIZE`
-- Continue until all images are attributed
-- Show progress after each batch
-- Pause 2 seconds between batches
-
-### Custom Batch Size
-
-Override the batch size from environment variables:
+**Custom Batch Size:**
 
 ```bash
 python main.py --batch-size 100
@@ -220,18 +268,18 @@ To modify the blocklist, edit `BLOCKLIST` in `main.py`.
 
 ### From Core API Service
 
-When new images are uploaded, they can be automatically attributed:
+When new images are uploaded, trigger attribution via HTTP:
 
 ```python
-# After uploading image to Supabase
-import subprocess
+import requests
 
-# Trigger attribution service
-subprocess.run([
-    "python",
-    "/path/to/media-attribution-service/main.py",
-    "--batch-size", "10"
-])
+# After uploading image to Supabase
+response = requests.get(
+    "http://media-attribution-service:8000/run-analysis",
+    params={"batch_size": 10}
+)
+result = response.json()
+print(f"Processed {result['images_processed']} images")
 ```
 
 ### From External Media Service
@@ -240,21 +288,47 @@ After processing images, trigger attribution:
 
 ```typescript
 // After image upload
-await fetch("http://media-attribution-service:8000/trigger", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    imageIds: [image.id],
-    batchSize: 10,
-  }),
-});
+const response = await fetch(
+  "http://media-attribution-service:8000/run-analysis?batch_size=10",
+  { method: "GET" }
+);
+const result = await response.json();
+console.log(`Processed ${result.images_processed} images`);
+```
+
+### Using Fetch API
+
+```javascript
+// Trigger single batch
+fetch("http://media-attribution-service:8000/run-analysis")
+  .then((res) => res.json())
+  .then((data) => console.log(data));
+
+// Trigger continuous processing
+fetch("http://media-attribution-service:8000/run-analysis?continuous=true")
+  .then((res) => res.json())
+  .then((data) => console.log(data));
 ```
 
 ## Scheduled Jobs
 
-To automatically attribute new images, set up a cron job:
+To automatically attribute new images, set up scheduled jobs:
 
-### Option 1: Cron Job
+### Option 1: HTTP API (Recommended)
+
+If the FastAPI server is running, trigger via HTTP from cron:
+
+```bash
+# Run every hour via HTTP
+0 * * * * curl "http://localhost:8000/run-analysis?batch_size=20"
+
+# Or continuous mode daily
+0 2 * * * curl "http://localhost:8000/run-analysis?continuous=true"
+```
+
+### Option 2: CLI Script
+
+Run the CLI script directly:
 
 ```bash
 # Run every hour
@@ -264,7 +338,7 @@ To automatically attribute new images, set up a cron job:
 0 2 * * * cd /path/to/media-attribution-service && python main.py --continuous
 ```
 
-### Option 2: GitHub Actions
+### Option 3: GitHub Actions
 
 Create `.github/workflows/attribution.yml`:
 
@@ -299,10 +373,20 @@ jobs:
 
 ```
 media-attribution-service/
-├── main.py              # Main service script
+├── main.py              # FastAPI service and CLI script
 ├── requirements.txt     # Python dependencies
+├── .gitignore           # Git ignore rules
 └── README.md           # This file
 ```
+
+### Service Architecture
+
+The service is built as a **FastAPI** application that can:
+
+- Run as an HTTP server for external API calls
+- Run as a CLI script for local development or cron jobs
+- Process images in batches with configurable batch sizes
+- Handle retries and fallbacks automatically
 
 ### Data Flow
 
@@ -318,10 +402,14 @@ media-attribution-service/
 ## Technology Stack
 
 - **Language**: Python 3.11+
+- **Web Framework**: FastAPI
+- **ASGI Server**: Uvicorn
 - **AI Model**: SpeciesNet (Google Camera Trap AI)
 - **Fallback**: OpenAI GPT-4 Vision
 - **Database**: Supabase (PostgreSQL)
 - **Dependencies**:
+  - `fastapi` - Modern, fast web framework for building APIs
+  - `uvicorn` - ASGI server for running FastAPI
   - `supabase` - Database client
   - `openai` - OpenAI API client
   - `speciesnet` - Google's species classification model
@@ -393,12 +481,57 @@ media-attribution-service/
 
 ## Production Deployment
 
-1. **Install dependencies** including SpeciesNet
+### Running as a Service
+
+1. **Install dependencies** including SpeciesNet:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
 2. **Set environment variables** in production environment
-3. **Configure cron job** or scheduled task for automatic processing
-4. **Set up monitoring** for error tracking and performance
-5. **Configure logging** to track processing progress
-6. **Set up alerts** for failed batches or errors
+
+3. **Run the FastAPI server** using a process manager like systemd, supervisor, or PM2:
+
+   ```bash
+   uvicorn main:app --host 0.0.0.0 --port 8000
+   ```
+
+   Or with production settings:
+
+   ```bash
+   uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+   ```
+
+4. **Set up reverse proxy** (nginx, Caddy, etc.) if needed
+
+5. **Configure health checks** - The service exposes `/run-analysis` endpoint for health monitoring
+
+### Scheduled Jobs
+
+You can trigger the service via HTTP requests from cron jobs:
+
+```bash
+# Run every hour via HTTP
+0 * * * * curl "http://localhost:8000/run-analysis?batch_size=20"
+```
+
+Or use the CLI mode for scheduled jobs:
+
+```bash
+# Run every hour
+0 * * * * cd /path/to/media-attribution-service && python main.py --batch-size 20
+
+# Or continuous mode daily
+0 2 * * * cd /path/to/media-attribution-service && python main.py --continuous
+```
+
+### Monitoring
+
+- **Set up monitoring** for error tracking and performance
+- **Configure logging** to track processing progress (logs are output to stdout)
+- **Set up alerts** for failed batches or errors
+- **Monitor API response times** and success rates
 
 ## License
 
