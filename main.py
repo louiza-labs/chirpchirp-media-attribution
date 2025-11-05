@@ -1,6 +1,6 @@
 # main.py — SpeciesNet (Google Camera Trap AI) for bird ID via --folders
 import os, time, logging, json, subprocess, argparse
-from typing import List, Dict
+from typing import List, Dict, Optional
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 import requests
 from collections import defaultdict
+from fastapi import FastAPI, Query
 
 # ---- Logging ----
 logging.basicConfig(
@@ -31,6 +32,7 @@ MODEL_VERSION = "speciesnet-ensemble"
 LOCATION = {"country": "USA", "admin1_region": "NY"}
 
 # ---- Clients ----
+app = FastAPI()
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -221,14 +223,22 @@ def upsert_attributions(image_id: str, species_rows: List[Dict]):
     } for s in species_rows]
     sb.table("attributions").upsert(rows, on_conflict="image_id,species,model_version").execute()
 
-def run_batch():
+def run_batch(batch_size: Optional[int] = None) -> Dict:
+    """Run a single batch of image attributions. Returns stats dict."""
+    actual_batch_size = batch_size or BATCH_SIZE
     logger.info("🪶 Starting bird attribution batch (SpeciesNet)…")
-    candidates = get_candidate_images(BATCH_SIZE)
+    candidates = get_candidate_images(actual_batch_size)
     if not candidates:
         logger.info("No images to attribute.")
-        return
+        return {
+            "success": True,
+            "images_processed": 0,
+            "attributions_created": 0,
+            "message": "No images to attribute"
+        }
 
     logger.info(f"Found {len(candidates)} images to classify")
+    attributions_count = 0
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
@@ -255,7 +265,12 @@ def run_batch():
 
         if downloaded == 0:
             logger.info("Nothing downloaded; exiting.")
-            return
+            return {
+                "success": False,
+                "images_processed": 0,
+                "attributions_created": 0,
+                "message": "Failed to download images"
+            }
 
         max_retries = 5
         for attempt in range(1, max_retries + 1):
@@ -289,6 +304,7 @@ def run_batch():
                 else:
                     logger.info(f"No species identified above threshold for {img_id}")
                 upsert_attributions(img_id, preds)
+                attributions_count += len(preds)
                 logger.info(f"✅ Saved {len(preds)} species attributions for {img_id}")
                 
                 # 100ms cooloff between upserts
@@ -333,7 +349,79 @@ def run_batch():
                     break
 
     logger.info("✨ Batch complete.")
+    return {
+        "success": True,
+        "images_processed": len(candidates),
+        "attributions_created": attributions_count,
+        "message": f"Processed {len(candidates)} images, created {attributions_count} attributions"
+    }
 
+def run_continuous(batch_size: Optional[int] = None) -> Dict:
+    """Run continuous mode: process all unattributed images. Returns stats dict."""
+    actual_batch_size = batch_size or BATCH_SIZE
+    logger.info("🔄 Continuous mode: processing all unattributed images...")
+    total_processed = 0
+    total_attributions = 0
+    batch_num = 1
+    
+    while True:
+        logger.info(f"\n{'='*60}")
+        logger.info(f"📦 Starting batch #{batch_num}")
+        logger.info(f"{'='*60}")
+        
+        # Check how many unattributed images remain
+        candidates = get_candidate_images(actual_batch_size)
+        if not candidates:
+            logger.info("✅ All images have been attributed!")
+            break
+        
+        logger.info(f"Found {len(candidates)} unattributed images in this batch")
+        
+        # Process this batch
+        result = run_batch(actual_batch_size)
+        if result.get("success"):
+            total_processed += result.get("images_processed", 0)
+            total_attributions += result.get("attributions_created", 0)
+        
+        batch_num += 1
+        
+        logger.info(f"📊 Progress: {total_processed} images processed so far")
+        logger.info("⏸️  Pausing 2 seconds before next batch...")
+        time.sleep(2)
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"🎉 Complete! Total images processed: {total_processed}")
+    logger.info(f"{'='*60}")
+    
+    return {
+        "success": True,
+        "images_processed": total_processed,
+        "attributions_created": total_attributions,
+        "batches_processed": batch_num - 1,
+        "message": f"Processed {total_processed} images in {batch_num - 1} batches, created {total_attributions} attributions"
+    }
+
+@app.get("/run-analysis")
+def run_analysis_endpoint(
+    continuous: bool = Query(default=False, description="Process all unattributed images in batches until none remain"),
+    batch_size: Optional[int] = Query(default=None, description="Override BATCH_SIZE from env (default: from .env or 50)")
+):
+    """Run bird species attribution analysis on unattributed images."""
+    try:
+        if continuous:
+            result = run_continuous(batch_size)
+        else:
+            result = run_batch(batch_size)
+        return result
+    except Exception as e:
+        logger.error(f"Error in run_analysis: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Failed to run analysis"
+        }
+
+# CLI entry point for backward compatibility
 def main():
     parser = argparse.ArgumentParser(description="Bird species attribution service")
     parser.add_argument(
@@ -348,46 +436,14 @@ def main():
     )
     args = parser.parse_args()
     
-    # Override batch size if provided
-    global BATCH_SIZE
-    if args.batch_size:
-        BATCH_SIZE = args.batch_size
-        logger.info(f"Batch size overridden to {BATCH_SIZE}")
-    
     if args.continuous:
-        logger.info("🔄 Continuous mode: processing all unattributed images...")
-        total_processed = 0
-        batch_num = 1
-        
-        while True:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"📦 Starting batch #{batch_num}")
-            logger.info(f"{'='*60}")
-            
-            # Check how many unattributed images remain
-            candidates = get_candidate_images(BATCH_SIZE)
-            if not candidates:
-                logger.info("✅ All images have been attributed!")
-                break
-            
-            logger.info(f"Found {len(candidates)} unattributed images in this batch")
-            
-            # Process this batch
-            run_batch()
-            
-            total_processed += len(candidates)
-            batch_num += 1
-            
-            logger.info(f"📊 Progress: {total_processed} images processed so far")
-            logger.info("⏸️  Pausing 2 seconds before next batch...")
-            time.sleep(2)
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"🎉 Complete! Total images processed: {total_processed}")
-        logger.info(f"{'='*60}")
+        result = run_continuous(args.batch_size)
+        print(json.dumps(result, indent=2))
     else:
-        # Single batch mode
-        run_batch()
+        result = run_batch(args.batch_size)
+        print(json.dumps(result, indent=2))
 
 if __name__ == "__main__":
     main()
+
+
