@@ -1,7 +1,17 @@
-supabase==2.6.0
-python-dotenv==1.0.1
-speciesnet
-requests==2.32.3
-openai==1.54.3
+# Web framework
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
+
+# Database
+supabase==2.6.0
+
+# AI/ML
+speciesnet
+opencv-python-headless==4.10.0.84
+
+# API clients
+openai==1.54.3
+requests==2.32.3
+
+# Utilities
+python-dotenv==1.0.1

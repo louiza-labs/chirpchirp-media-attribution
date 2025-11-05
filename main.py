@@ -144,10 +144,13 @@ def parse_speciesnet_output(
     preds = data.get("predictions", []) or []
     per_image: Dict[str, List[Dict]] = defaultdict(list)
 
+    logger.info(f"📊 Parsing {len(preds)} predictions from SpeciesNet output...")
+
     for p in preds:
         filepath = p.get("filepath")
         image_id = path_to_image_id.get(filepath)
         if not image_id:
+            logger.debug(f"Skipping {filepath} - no matching image_id")
             continue
 
         label = p.get("prediction")
@@ -155,12 +158,20 @@ def parse_speciesnet_output(
 
         # Clean up the label for display
         species_name = _extract_species_name(label)
+        
+        # Log the primary prediction for this image
+        logger.info(f"🖼️  Image {image_id}: Primary prediction = {species_name} (confidence: {score:.2%}, threshold: {threshold:.2%})")
 
         if species_name.lower() not in BLOCKLIST and (score or 0.0) >= threshold:
             per_image[image_id].append({
                 "name": species_name,
                 "confidence": float(score)
             })
+            logger.info(f"  ✅ Added {species_name} to predictions (above threshold)")
+        elif species_name.lower() in BLOCKLIST:
+            logger.info(f"  ⛔ Skipped {species_name} (blocklisted)")
+        else:
+            logger.info(f"  ⬇️  Skipped {species_name} (below threshold: {score:.2%} < {threshold:.2%})")
 
         # Classifier fallback top-5
         failures = set(p.get("failures", []) or [])
@@ -168,9 +179,11 @@ def parse_speciesnet_output(
             cls = p.get("classifications") or {}
             classes = cls.get("classes") or []
             scores = cls.get("scores") or []
-            for alt_label, alt_score in list(zip(classes, scores))[:5]:
+            logger.info(f"  📋 Classifier top-5 alternatives for {image_id}:")
+            for idx, (alt_label, alt_score) in enumerate(list(zip(classes, scores))[:5], 1):
                 alt_species = _extract_species_name(alt_label)
                 if alt_species.lower() in BLOCKLIST:
+                    logger.info(f"    {idx}. {alt_species} ({alt_score:.2%}) - blocklisted, skipped")
                     continue
                 try:
                     alt_conf = float(alt_score)
@@ -181,6 +194,12 @@ def parse_speciesnet_output(
                         "name": alt_species,
                         "confidence": alt_conf
                     })
+                    logger.info(f"    {idx}. {alt_species} ({alt_conf:.2%}) - ✅ added")
+                else:
+                    reason = "same as primary" if alt_species == species_name else f"below threshold ({alt_conf:.2%} < {threshold:.2%})"
+                    logger.info(f"    {idx}. {alt_species} ({alt_conf:.2%}) - ⬇️  skipped ({reason})")
+        else:
+            logger.info(f"  ⚠️  Classifier failed for {image_id}")
 
         # Dedup + sort
         if per_image.get(image_id):
@@ -190,6 +209,9 @@ def parse_speciesnet_output(
                 if k not in uniq or r["confidence"] > uniq[k]["confidence"]:
                     uniq[k] = r
             per_image[image_id] = sorted(uniq.values(), key=lambda x: x["confidence"], reverse=True)
+            logger.info(f"  📊 Final predictions for {image_id}: {len(per_image[image_id])} species")
+            for idx, pred in enumerate(per_image[image_id], 1):
+                logger.info(f"    {idx}. {pred['name']}: {pred['confidence']:.2%}")
 
     return per_image
 
