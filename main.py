@@ -234,9 +234,60 @@ def get_candidate_images(limit: int):
     attributed = {r["image_id"] for r in existing}
     return [r for r in images if r["id"] not in attributed and r.get("image_url")][:limit]
 
-def upsert_attributions(image_id: str, species_rows: List[Dict]):
+def check_first_time_species(species_names: List[str]) -> set:
+    """Check which species are appearing for the first time. Returns set of new species."""
+    if not species_names:
+        return set()
+    
+    try:
+        # Query to see which species already exist in attributions
+        existing = (sb.table("attributions")
+                     .select("species")
+                     .in_("species", species_names)
+                     .execute()).data or []
+        
+        existing_species = {r["species"] for r in existing}
+        new_species = set(species_names) - existing_species
+        return new_species
+    except Exception as e:
+        logger.error(f"Error checking first-time species: {e}")
+        return set()
+
+def notify_special_sighting(species: str, image_url: str, confidence: float):
+    """Notify external service about a first-time species sighting."""
+    try:
+        url = "https://chirp-chirp-email-service-260006186791.us-east4.run.app/email/send/special-sighting"
+        payload = {
+            "species": species,
+            "imageUrl": image_url,
+            "confidence": confidence
+        }
+        logger.info(f"🚨 First-time sighting of {species}! Notifying service...")
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        logger.info(f"✅ Special sighting notification sent for {species}")
+    except Exception as e:
+        logger.error(f"Failed to send special sighting notification for {species}: {e}")
+
+def upsert_attributions(image_id: str, species_rows: List[Dict], image_url: str = None, check_first_time: bool = False):
+    """
+    Upsert attributions and optionally check for first-time species.
+    
+    Args:
+        image_id: ID of the image
+        species_rows: List of dicts with 'name' and 'confidence'
+        image_url: URL of the image (required if check_first_time=True)
+        check_first_time: Whether to check and notify about first-time species
+    """
     if not species_rows:
         return
+    
+    # Check for first-time species before upserting
+    first_time_species = set()
+    if check_first_time:
+        species_names = [s["name"] for s in species_rows]
+        first_time_species = check_first_time_species(species_names)
+    
     rows = [{
         "image_id": image_id,
         "model_version": MODEL_VERSION,
@@ -245,6 +296,12 @@ def upsert_attributions(image_id: str, species_rows: List[Dict]):
         "extra": None,
     } for s in species_rows]
     sb.table("attributions").upsert(rows, on_conflict="image_id,species,model_version").execute()
+    
+    # Notify about first-time species after successful upsert
+    if check_first_time and first_time_species and image_url:
+        for species_row in species_rows:
+            if species_row["name"] in first_time_species:
+                notify_special_sighting(species_row["name"], image_url, species_row["confidence"])
 
 def run_batch(batch_size: Optional[int] = None) -> Dict:
     """Run a single batch of image attributions. Returns stats dict."""
@@ -326,7 +383,10 @@ def run_batch(batch_size: Optional[int] = None) -> Dict:
                         logger.info(f"  - {p['name']}: {p['confidence']:.2%}")
                 else:
                     logger.info(f"No species identified above threshold for {img_id}")
-                upsert_attributions(img_id, preds)
+                
+                # Get image URL for this image
+                img_url = next((r["image_url"] for r in candidates if r["id"] == img_id), None)
+                upsert_attributions(img_id, preds, image_url=img_url, check_first_time=True)
                 attributions_count += len(preds)
                 logger.info(f"✅ Saved {len(preds)} species attributions for {img_id}")
                 
@@ -367,7 +427,7 @@ def run_batch(batch_size: Optional[int] = None) -> Dict:
                         
                         if openai_preds:
                             # Update with OpenAI results
-                            upsert_attributions(img_id, openai_preds)
+                            upsert_attributions(img_id, openai_preds, image_url=url, check_first_time=True)
                             logger.info(f"✅ Saved {len(openai_preds)} OpenAI predictions for {img_id}")
                         else:
                             logger.info(f"⚠️  No OpenAI predictions for {img_id}")
@@ -433,10 +493,7 @@ def run_analysis_endpoint(
 ):
     """Run bird species attribution analysis on unattributed images."""
     try:
-        if continuous:
-            result = run_continuous(batch_size)
-        else:
-            result = run_batch(batch_size)
+        result = run_continuous(batch_size)
         return result
     except Exception as e:
         logger.error(f"Error in run_analysis: {e}", exc_info=True)
