@@ -36,7 +36,8 @@ app = FastAPI()
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-BLOCKLIST = {"blank", "unknown", "vehicle", "human", "person", ""}
+BLOCKLIST = {"blank", "unknown", "vehicle", "human", "person", "animal", "cyanocitta species", "eastern gray squirrel", "no cv result"}
+ 
 
 # ---- Helpers ----
 def download_image(url: str, output_path: Path) -> bool:
@@ -66,7 +67,7 @@ def classify_with_openai(image_url: str) -> List[Dict]:
     try:
         logger.info("🔄 Falling back to OpenAI vision...")
         response = openai_client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5",
             messages=[
                 {
                     "role": "user",
@@ -350,13 +351,18 @@ def run_batch(batch_size: Optional[int] = None) -> Dict:
                 else:
                     # Final retry exhausted, fall back to OpenAI
                     logger.info(f"⚠️  {len(generic_left)} images still generic after {max_retries} retries. Using OpenAI fallback...")
-                    for img_id in generic_left:
+                    for idx, img_id in enumerate(generic_left):
                         # Find the original URL from candidates
                         url = next((r["image_url"] for r in candidates if r["id"] == img_id), None)
                         if not url:
                             continue
                         
-                        logger.info(f"🤖 OpenAI fallback for {img_id}")
+                        # Rate limiting: wait before each call (except the first)
+                        if idx > 0:
+                            logger.info(f"⏳ Waiting 3 seconds before next OpenAI call to respect rate limits...")
+                            time.sleep(3)
+                        
+                        logger.info(f"🤖 OpenAI fallback for {img_id} ({idx + 1}/{len(generic_left)})")
                         openai_preds = classify_with_openai(url)
                         
                         if openai_preds:
@@ -365,9 +371,6 @@ def run_batch(batch_size: Optional[int] = None) -> Dict:
                             logger.info(f"✅ Saved {len(openai_preds)} OpenAI predictions for {img_id}")
                         else:
                             logger.info(f"⚠️  No OpenAI predictions for {img_id}")
-                        
-                        # Longer cooloff for OpenAI to respect rate limits
-                        time.sleep(1)
                     break
 
     logger.info("✨ Batch complete.")
