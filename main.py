@@ -9,6 +9,7 @@ from pathlib import Path
 import requests
 from collections import defaultdict
 from fastapi import FastAPI, Query
+from pydantic import BaseModel
 
 # ---- Logging ----
 logging.basicConfig(
@@ -486,14 +487,18 @@ def run_continuous(batch_size: Optional[int] = None) -> Dict:
         "message": f"Processed {total_processed} images in {batch_num - 1} batches, created {total_attributions} attributions"
     }
 
-@app.get("/run-analysis")
-def run_analysis_endpoint(
-    continuous: bool = Query(default=False, description="Process all unattributed images in batches until none remain"),
-    batch_size: Optional[int] = Query(default=None, description="Override BATCH_SIZE from env (default: from .env or 50)")
-):
+class AnalysisRequest(BaseModel):
+    continuous: bool = True
+    batch_size: Optional[int] = None
+    triggered_by: Optional[str] = None
+    timestamp: Optional[str] = None
+
+@app.post("/run-analysis")
+def run_analysis_endpoint(request: AnalysisRequest):
     """Run bird species attribution analysis on unattributed images."""
     try:
-        result = run_continuous(batch_size)
+        logger.info(f"Analysis triggered by: {request.triggered_by or 'unknown'}")
+        result = run_continuous(request.batch_size)
         return result
     except Exception as e:
         logger.error(f"Error in run_analysis: {e}", exc_info=True)
